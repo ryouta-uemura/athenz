@@ -113,6 +113,9 @@ public class JDBCConnection implements ObjectStoreConnection {
     private static final String SQL_GET_DOMAIN_MOD_TIMESTAMP = "SELECT modified FROM domain WHERE name=?;";
     private static final String SQL_LIST_DOMAIN = "SELECT * FROM domain;";
     private static final String SQL_LIST_DOMAIN_MODIFIED = "SELECT * FROM domain WHERE modified>?;";
+    private static final String SQL_LIST_DOMAIN_META = "SELECT name, modified, enabled FROM domain;";
+    private static final String SQL_LIST_DOMAIN_META_MODIFIED = "SELECT name, modified, enabled FROM domain "
+            + "WHERE modified>?;";
     private static final String SQL_LIST_DOMAIN_NAME = "SELECT name FROM domain;";
     private static final String SQL_LIST_DOMAIN_NAME_PREFIX = "SELECT name FROM domain WHERE name>=? AND name<?;";
     private static final String SQL_LIST_DOMAIN_NAME_MODIFIED = "SELECT name FROM domain WHERE modified>?;";
@@ -1027,6 +1030,16 @@ public class JDBCConnection implements ObjectStoreConnection {
         return domain;
     }
 
+    /**
+     * Maps the rows returned by {@link #prepareDomainMetaScanStatement}, which
+     * selects only the name, modified and enabled columns.
+     */
+    Domain saveDomainMetaSettings(String domainName, ResultSet rs) throws SQLException {
+        return new Domain().setName(domainName)
+                .setEnabled(rs.getBoolean(JDBCConsts.DB_COLUMN_ENABLED))
+                .setModified(Timestamp.fromMillis(rs.getTimestamp(JDBCConsts.DB_COLUMN_MODIFIED).getTime()));
+    }
+
     @Override
     public Domain getDomain(String domainName) throws ServerResourceException {
 
@@ -1384,6 +1397,25 @@ public class JDBCConnection implements ObjectStoreConnection {
             ps.setTimestamp(1, new java.sql.Timestamp(modifiedSince), cal);
         } else {
             ps = con.prepareStatement(SQL_LIST_DOMAIN);
+        }
+        return ps;
+    }
+
+    /**
+     * Selects only the name, modified and enabled columns. Callers must not read
+     * any other column from the result set - use {@link #saveDomainMetaSettings}
+     * rather than {@link #saveDomainSettings} to map the rows.
+     */
+    PreparedStatement prepareDomainMetaScanStatement(long modifiedSince)
+            throws SQLException {
+
+        PreparedStatement ps;
+        if (modifiedSince != 0) {
+            ps = con.prepareStatement(SQL_LIST_DOMAIN_META_MODIFIED);
+            Calendar cal = Calendar.getInstance(TimeZone.getTimeZone(MYSQL_SERVER_TIMEZONE));
+            ps.setTimestamp(1, new java.sql.Timestamp(modifiedSince), cal);
+        } else {
+            ps = con.prepareStatement(SQL_LIST_DOMAIN_META);
         }
         return ps;
     }
@@ -4798,17 +4830,33 @@ public class JDBCConnection implements ObjectStoreConnection {
 
     @Override
     public DomainMetaList listModifiedDomains(long modifiedSince) throws ServerResourceException {
+        return getModifiedDomainList(modifiedSince, true);
+    }
+
+    @Override
+    public DomainMetaList listModifiedDomains(long modifiedSince, String metaAttr) throws ServerResourceException {
+
+        // the caller only reads the name, modified and enabled attributes unless
+        // it was asked for a specific meta attribute, in which case we don't know
+        // which column that maps to, so we have to fetch the full row
+
+        return getModifiedDomainList(modifiedSince, metaAttr != null);
+    }
+
+    DomainMetaList getModifiedDomainList(long modifiedSince, boolean fullRow) throws ServerResourceException {
 
         final String caller = "listModifiedDomains";
 
         DomainMetaList domainModifiedList = new DomainMetaList();
         List<Domain> nameMods = new ArrayList<>();
 
-        try (PreparedStatement ps = prepareDomainRowScanStatement(modifiedSince)) {
+        try (PreparedStatement ps = fullRow ? prepareDomainRowScanStatement(modifiedSince) :
+                prepareDomainMetaScanStatement(modifiedSince)) {
             try (ResultSet rs = executeQuery(ps, caller)) {
                 while (rs.next()) {
                     final String domainName = rs.getString(JDBCConsts.DB_COLUMN_NAME);
-                    nameMods.add(saveDomainSettings(domainName, rs, false));
+                    nameMods.add(fullRow ? saveDomainSettings(domainName, rs, false) :
+                            saveDomainMetaSettings(domainName, rs));
                 }
             }
         } catch (SQLException ex) {

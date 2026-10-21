@@ -8453,7 +8453,7 @@ public class ZMSImpl implements Authorizer, KeyStore, ZMSHandler {
             // read-only mode in which case it indicates that our master write
             // db is not available thus we'll use the read replica
 
-            DomainMetaList dmlist = dbService.listModifiedDomains(timestamp, !readOnlyMode.get());
+            DomainMetaList dmlist = dbService.listModifiedDomains(timestamp, !readOnlyMode.get(), metaAttr);
             List<Domain> modlist = dmlist.getDomains();
             if (ZMSUtils.isCollectionEmpty(modlist)) {
                 return Response.status(ResourceException.NOT_MODIFIED)

@@ -56,6 +56,21 @@ public interface ObjectStoreConnection extends Closeable {
     List<String> lookupDomainByBusinessService(String businessService) throws ServerResourceException;
     AthenzDomain getAthenzDomain(String domainName) throws ServerResourceException;
     DomainMetaList listModifiedDomains(long modifiedSince) throws ServerResourceException;
+
+    /**
+     * Same as {@link #listModifiedDomains(long)}, but the caller states which domain
+     * meta attribute it is going to read. When metaAttr is null the caller only reads
+     * the name, modified and enabled attributes, so an implementation may skip loading
+     * the remaining ones. The default implementation ignores the hint and returns the
+     * full domain objects.
+     * @param modifiedSince only return domains modified after this timestamp
+     * @param metaAttr domain meta attribute the caller will read, or null for none
+     * @return list of modified domains
+     * @throws ServerResourceException in case of any errors
+     */
+    default DomainMetaList listModifiedDomains(long modifiedSince, String metaAttr) throws ServerResourceException {
+        return listModifiedDomains(modifiedSince);
+    }
     void setDomainOptions(DomainOptions domainOptions) throws ServerResourceException;
     default Map<String, String> listDomainsWithExternalMemberValidator() throws ServerResourceException {
         return Collections.emptyMap();

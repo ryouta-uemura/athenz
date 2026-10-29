@@ -63,6 +63,7 @@ const secrets = {};
 const expressApp = require('express')();
 const request = require('supertest');
 const bodyParser = require('body-parser');
+const getGroupCalls = jest.fn();
 const {
     listUserDomains_response,
     getPrincipalRoles_response,
@@ -336,7 +337,18 @@ describe('Fetchr Server API Test', () => {
                                 ? callback({ status: 404 }, null)
                                 : callback(undefined, {
                                       roleMembers: [
-                                          { memberName: 'user.user1' },
+                                          ...(params.roleName === 'users'
+                                              ? [
+                                                    {
+                                                        memberName:
+                                                            'a:group.one',
+                                                    },
+                                                    {
+                                                        memberName:
+                                                            'b:group.two',
+                                                    },
+                                                ]
+                                              : [{ memberName: 'user.user1' }]),
                                       ],
                                       auditLog: [
                                           {
@@ -346,6 +358,10 @@ describe('Fetchr Server API Test', () => {
                                           },
                                       ],
                                   }),
+                        getGroup: (params, callback) => {
+                            getGroupCalls(params);
+                            callback({ status: 429 }, null);
+                        },
                         putRole: (params, callback) =>
                             params.forcefail
                                 ? callback({ status: 404 }, null)
@@ -1181,6 +1197,21 @@ describe('Fetchr Server API Test', () => {
                         ],
                     });
                 });
+        });
+        it('does not fetch referenced groups while reading a role', async () => {
+            getGroupCalls.mockClear();
+            await request(expressApp)
+                .get('/api/v1/role;domainName=shepherd.ws;roleName=users')
+                .expect(200)
+                .then((res) => {
+                    expect(res.body.roleMembers).toHaveLength(2);
+                });
+            expect(getGroupCalls).not.toHaveBeenCalled();
+        });
+        it('returns a group read error once', async () => {
+            await request(expressApp)
+                .get('/api/v1/group;domainName=a;groupName=one')
+                .expect(429);
         });
         it('putRole test success', async () => {
             await request(expressApp)

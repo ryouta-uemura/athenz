@@ -434,7 +434,6 @@ class MemberRow extends React.Component {
                             }
                         >
                             <GroupMemberList
-                                member={member}
                                 groupName={member.memberName}
                                 timeZone={this.props.timeZone}
                             />

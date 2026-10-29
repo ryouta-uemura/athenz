@@ -1391,36 +1391,6 @@ Fetchr.registerService({
 Fetchr.registerService({
     name: 'role',
     read(req, resource, params, config, callback) {
-        let promises = [];
-
-        const getGroupMembers = (domainName, groupName, roleMember) => {
-            return new Promise((resolve, reject) => {
-                req.clients.zms.getGroup(
-                    { domainName, groupName },
-                    (err, data) => {
-                        if (err) {
-                            if (err.status === 404) {
-                                resolve();
-                            } else {
-                                reject(err);
-                            }
-                        } else {
-                            if (data && data.groupMembers) {
-                                roleMember.groupMembers = data.groupMembers;
-                                roleMember.groupMembers.forEach((member) => {
-                                    member.memberFullName =
-                                        userService.getUserFullName(
-                                            member.memberName
-                                        );
-                                });
-                            }
-                            resolve();
-                        }
-                    }
-                );
-            });
-        };
-
         req.clients.zms.getRole(params, function (err, data) {
             if (err) {
                 debug(
@@ -1431,6 +1401,7 @@ Fetchr.registerService({
                     )}`
                 );
                 callback(errorHandler.fetcherError(err));
+                return;
             }
             if (data && data.trust) {
                 req.clients.zms.getRole(
@@ -1451,6 +1422,7 @@ Fetchr.registerService({
                                 )}`
                             );
                             callback(errorHandler.fetcherError(err));
+                            return;
                         }
                         if (data) {
                             if (data.auditLog) {
@@ -1469,34 +1441,8 @@ Fetchr.registerService({
                                             member.memberName
                                         );
                                 });
-
-                                roleMembers.forEach((member) => {
-                                    if (member.memberName.includes(':group.')) {
-                                        promises.push(
-                                            getGroupMembers(
-                                                member.memberName.split(
-                                                    ':group.'
-                                                )[0],
-                                                member.memberName.split(
-                                                    ':group.'
-                                                )[1],
-                                                member
-                                            )
-                                        );
-                                    }
-                                });
-                                Promise.all(promises)
-                                    .then(() => {
-                                        callback(null, data);
-                                    })
-                                    .catch((err) => {
-                                        callback(
-                                            errorHandler.fetcherError(err)
-                                        );
-                                    });
-                            } else {
-                                callback(null, data);
                             }
+                            callback(null, data);
                         }
                     }
                 );
@@ -1516,27 +1462,10 @@ Fetchr.registerService({
                             member.memberName
                         );
                     });
-                    roleMembers.forEach((member) => {
-                        if (member.memberName.includes(':group.')) {
-                            promises.push(
-                                getGroupMembers(
-                                    member.memberName.split(':group.')[0],
-                                    member.memberName.split(':group.')[1],
-                                    member
-                                )
-                            );
-                        }
-                    });
-                    Promise.all(promises)
-                        .then(() => {
-                            callback(null, data);
-                        })
-                        .catch((err) => {
-                            callback(errorHandler.fetcherError(err));
-                        });
-                } else {
-                    callback(null, data);
                 }
+                callback(null, data);
+            } else {
+                callback(null, data);
             }
         });
     },
@@ -2353,6 +2282,7 @@ Fetchr.registerService({
                 } else {
                     callback(null, []);
                 }
+                return;
             }
             if (data && data.groupMembers) {
                 data.groupMembers.forEach((member) => {

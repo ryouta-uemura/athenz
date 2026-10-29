@@ -18,6 +18,7 @@ import styled from '@emotion/styled';
 import Button from '../denali/Button';
 import DateUtils from '../utils/DateUtils';
 import { withRouter } from 'next/router';
+import API from '../../api';
 
 const StyleTable = styled.table`
     width: 100%;
@@ -63,7 +64,44 @@ class GroupMemberList extends React.Component {
     constructor(props) {
         super(props);
         this.viewGroup = this.viewGroup.bind(this);
+        this.loadMembers = this.loadMembers.bind(this);
         this.localDate = new DateUtils();
+        this.state = { loading: true, members: null, error: false };
+    }
+
+    componentDidMount() {
+        this.mounted = true;
+        this.loadMembers();
+    }
+
+    componentWillUnmount() {
+        this.mounted = false;
+    }
+
+    async loadMembers() {
+        const [domainName, groupName] = this.props.groupName.split(':group.');
+        this.setState({ loading: true, members: null, error: false });
+        try {
+            const group = await API().getGroup(
+                domainName,
+                groupName,
+                false,
+                false
+            );
+            if (this.mounted) {
+                this.setState({
+                    loading: false,
+                    members: Array.isArray(group)
+                        ? null
+                        : group.groupMembers || [],
+                    error: false,
+                });
+            }
+        } catch (error) {
+            if (this.mounted) {
+                this.setState({ loading: false, members: null, error: true });
+            }
+        }
     }
 
     viewGroup(e) {
@@ -77,12 +115,31 @@ class GroupMemberList extends React.Component {
     }
 
     render() {
-        const { member } = this.props;
+        const { loading, members, error } = this.state;
         let rows;
-        if (member.groupMembers) {
-            rows = member.groupMembers.map((item, i) => {
+        if (loading || error || members === null || members.length === 0) {
+            rows = (
+                <StyledTr>
+                    <StyledTd colSpan={2}>
+                        {loading
+                            ? 'Loading group members...'
+                            : error
+                            ? 'Unable to load group members.'
+                            : members === null
+                            ? 'Group not found.'
+                            : 'No members in group.'}
+                        {error && (
+                            <Button secondary onClick={this.loadMembers}>
+                                Retry
+                            </Button>
+                        )}
+                    </StyledTd>
+                </StyledTr>
+            );
+        } else {
+            rows = members.map((item) => {
                 return (
-                    <StyledTr>
+                    <StyledTr key={item.memberName}>
                         <StyledTd>{item.memberName}</StyledTd>
                         <StyledTd>
                             {item.expiration
@@ -96,18 +153,12 @@ class GroupMemberList extends React.Component {
                     </StyledTr>
                 );
             });
-        } else {
-            rows = (
-                <StyledTr>
-                    <StyledTd colSpan={2}>{'No members in group.'}</StyledTd>
-                </StyledTr>
-            );
         }
 
         return (
             <StyledDiv>
                 <StyleTable>
-                    {member.groupMembers ? (
+                    {members && members.length > 0 ? (
                         <StyledTr>
                             <StyledTh> Member </StyledTh>
                             <StyledTh> Expiry </StyledTh>

@@ -49,9 +49,12 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -78,6 +81,61 @@ public class DBService implements RolesProvider, DomainProvider {
     ResourceUpdaterManager resourceUpdaterManager;
 
     private static final Logger LOG = LoggerFactory.getLogger(DBService.class);
+    private static final Logger DOMAIN_CACHE_LOG = LoggerFactory.getLogger("com.yahoo.athenz.zms.domaincache");
+    private static final long DOMAIN_CACHE_REPORT_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1);
+
+    // Counters are only updated while diagnostics are enabled. No domain names are logged.
+    static class DomainCacheDiagnostics {
+        final LongAdder hits = new LongAdder();
+        final LongAdder fallbackHits = new LongAdder();
+        final LongAdder absentMisses = new LongAdder();
+        final LongAdder staleMisses = new LongAdder();
+        final LongAdder loads = new LongAdder();
+        final LongAdder loadFailures = new LongAdder();
+        final LongAdder overlappingLoads = new LongAdder();
+        final LongAdder loadNanos = new LongAdder();
+        final ConcurrentHashMap<String, Integer> activeLoads = new ConcurrentHashMap<>();
+        final AtomicLong nextReportNanos = new AtomicLong(System.nanoTime() + DOMAIN_CACHE_REPORT_INTERVAL_NANOS);
+
+        void startLoad(String domainName) {
+            boolean[] overlap = { false };
+            activeLoads.compute(domainName, (name, count) -> {
+                if (count == null) {
+                    return 1;
+                }
+                overlap[0] = true;
+                return count + 1;
+            });
+            if (overlap[0]) {
+                overlappingLoads.increment();
+            }
+        }
+
+        void finishLoad(String domainName, long startNanos, boolean success) {
+            activeLoads.computeIfPresent(domainName, (name, count) -> count == 1 ? null : count - 1);
+            loads.increment();
+            if (!success) {
+                loadFailures.increment();
+            }
+            loadNanos.add(System.nanoTime() - startNanos);
+            reportIfDue();
+        }
+
+        void reportIfDue() {
+            long now = System.nanoTime();
+            long next = nextReportNanos.get();
+            if (now - next < 0 || !nextReportNanos.compareAndSet(next, now + DOMAIN_CACHE_REPORT_INTERVAL_NANOS)) {
+                return;
+            }
+            DOMAIN_CACHE_LOG.info("domain_cache_diagnostics hits={} fallback_hits={} absent_misses={} stale_misses={} loads={} load_failures={} overlapping_loads={} load_time_ms={}",
+                    hits.sumThenReset(), fallbackHits.sumThenReset(), absentMisses.sumThenReset(),
+                    staleMisses.sumThenReset(), loads.sumThenReset(), loadFailures.sumThenReset(),
+                    overlappingLoads.sumThenReset(), TimeUnit.NANOSECONDS.toMillis(loadNanos.sumThenReset()));
+        }
+    }
+
+    final DomainCacheDiagnostics domainCacheDiagnostics = new DomainCacheDiagnostics();
+    protected DynamicConfigBoolean domainCacheDiagnosticsEnabled;
 
     public static int AUDIT_TYPE_ROLE     = 0;
     public static int AUDIT_TYPE_POLICY   = 1;
@@ -139,6 +197,8 @@ public class DBService implements RolesProvider, DomainProvider {
         this.auditLogger = auditLogger;
         this.authHistoryStore = authHistoryStore;
         cacheStore = CacheBuilder.newBuilder().concurrencyLevel(25).build();
+        domainCacheDiagnosticsEnabled = new DynamicConfigBoolean(CONFIG_MANAGER,
+                ZMSConsts.ZMS_PROP_DOMAIN_CACHE_DIAGNOSTICS_ENABLED, false);
 
         monitorIdentity = System.getProperty(ZMSConsts.ZMS_PROP_MONITOR_IDENTITY, ZMSConsts.SYS_AUTH_MONITOR);
 
@@ -325,8 +385,13 @@ public class DBService implements RolesProvider, DomainProvider {
     
     AthenzDomain getAthenzDomainFromCache(ObjectStoreConnection con, String domainName) {
 
+        boolean diagnosticsEnabled = Boolean.TRUE.equals(domainCacheDiagnosticsEnabled.get());
         DataCache data = cacheStore.getIfPresent(domainName);
         if (data == null) {
+            if (diagnosticsEnabled) {
+                domainCacheDiagnostics.absentMisses.increment();
+                domainCacheDiagnostics.reportIfDue();
+            }
             return null;
         }
 
@@ -339,10 +404,12 @@ public class DBService implements RolesProvider, DomainProvider {
         // full domain data from db
 
         long modTime = 0;
+        boolean timestampCheckFailed = false;
 
         try {
             modTime = con.getDomainModTimestamp(domainName);
         } catch (ServerResourceException ignored) {
+            timestampCheckFailed = true;
             // if the exception is due to timeout or we were not able
             // to get a connection to the object store then we're
             // going to use our cache as is instead of rejecting
@@ -355,9 +422,21 @@ public class DBService implements RolesProvider, DomainProvider {
         // hasn't replicated the data yet)
 
         if (data.getModTime() >= modTime) {
+            if (diagnosticsEnabled) {
+                if (timestampCheckFailed) {
+                    domainCacheDiagnostics.fallbackHits.increment();
+                } else {
+                    domainCacheDiagnostics.hits.increment();
+                }
+                domainCacheDiagnostics.reportIfDue();
+            }
             return data.getAthenzDomain();
         }
 
+        if (diagnosticsEnabled) {
+            domainCacheDiagnostics.staleMisses.increment();
+            domainCacheDiagnostics.reportIfDue();
+        }
         cacheStore.invalidate(domainName);
         return null;
     }
@@ -6939,15 +7018,28 @@ public class DBService implements RolesProvider, DomainProvider {
             return athenzDomain;
         }
 
-        athenzDomain = con.getAthenzDomain(domainName);
-        athenzDomain.setRoleMemberPrincipalTypes(zmsConfig.getUserDomainPrefix(),
-                zmsConfig.getAddlUserCheckDomainPrefixList(), zmsConfig.getHeadlessUserDomainPrefix());
+        boolean diagnosticsEnabled = Boolean.TRUE.equals(domainCacheDiagnosticsEnabled.get());
+        long loadStartNanos = 0;
+        if (diagnosticsEnabled) {
+            domainCacheDiagnostics.startLoad(domainName);
+            loadStartNanos = System.nanoTime();
+        }
+        boolean success = false;
+        try {
+            athenzDomain = con.getAthenzDomain(domainName);
+            athenzDomain.setRoleMemberPrincipalTypes(zmsConfig.getUserDomainPrefix(),
+                    zmsConfig.getAddlUserCheckDomainPrefixList(), zmsConfig.getHeadlessUserDomainPrefix());
 
-        DataCache dataCache = new DataCache(athenzDomain,
-                athenzDomain.getDomain().getModified().millis());
-        cacheStore.put(domainName, dataCache);
-
-        return athenzDomain;
+            DataCache dataCache = new DataCache(athenzDomain,
+                    athenzDomain.getDomain().getModified().millis());
+            cacheStore.put(domainName, dataCache);
+            success = true;
+            return athenzDomain;
+        } finally {
+            if (diagnosticsEnabled) {
+                domainCacheDiagnostics.finishLoad(domainName, loadStartNanos, success);
+            }
+        }
     }
 
     DomainMetaList listModifiedDomains(long modifiedSince, boolean readWrite, boolean fetchFullRow) {

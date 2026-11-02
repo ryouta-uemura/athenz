@@ -116,6 +116,7 @@ public final class ZMSConsts {
     public static final String ZMS_PROP_ALLOW_UNDERSCORE_IN_SERVICE_NAMES     = "athenz.zms.allow_underscore_in_service_names";
     public static final String ZMS_PROP_DOMAIN_DELETE_META_ATTRIBUTES         = "athenz.zms.domain_delete_meta_attributes";
     public static final String ZMS_PROP_DISALLOW_GROUPS_IN_ADMIN_ROLE         = "athenz.zms.disallow_groups_in_admin_role";
+    public static final String ZMS_PROP_DOMAIN_CACHE_DIAGNOSTICS_ENABLED      = "athenz.zms.domain_cache_diagnostics_enabled";
 
     // properties used to over-ride default Audit logger
  

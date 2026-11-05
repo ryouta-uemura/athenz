@@ -339,12 +339,14 @@ public class JDBCConnection implements ObjectStoreConnection {
     private static final String SQL_LIST_POLICY_REFERENCING_ROLE = "SELECT name FROM policy "
             + "JOIN assertion ON policy.policy_id=assertion.policy_id "
             + "WHERE policy.domain_id=? AND assertion.role=?;";
+    private static final int RESOURCE_ACCESS_QUERY_BATCH_SIZE = 100;
     private static final String SQL_LIST_ROLE_ASSERTIONS = "SELECT assertion.role, assertion.resource, "
             + "assertion.action, assertion.effect, assertion.case_sensitive, assertion.assertion_id, policy.domain_id, domain.name FROM assertion "
             + "JOIN policy ON assertion.policy_id=policy.policy_id "
-            + "JOIN domain ON policy.domain_id=domain.domain_id";
-    private static final String SQL_LIST_ROLE_ASSERTION_QUERY_ACTION = " WHERE assertion.action=?;";
-    private static final String SQL_LIST_ROLE_ASSERTION_NO_ACTION = " WHERE assertion.action!='assume_role';";
+            + "JOIN domain ON policy.domain_id=domain.domain_id "
+            + "WHERE policy.domain_id=? AND assertion.role IN (";
+    private static final String SQL_LIST_ROLE_ASSERTION_QUERY_ACTION = ") AND assertion.action=?;";
+    private static final String SQL_LIST_ROLE_ASSERTION_NO_ACTION = ") AND assertion.action!='assume_role';";
     private static final String SQL_LIST_ROLE_PRINCIPALS = "SELECT role.domain_id, role.name AS role_name FROM principal "
             + "JOIN role_member ON principal.principal_id=role_member.principal_id "
             + "JOIN role ON role_member.role_id=role.role_id WHERE principal.name=? "
@@ -4883,47 +4885,73 @@ public class JDBCConnection implements ObjectStoreConnection {
         return domainId + ':' + roleName;
     }
 
-    PreparedStatement prepareRoleAssertionsStatement(String action)
+    String placeholders(int count) {
+        return String.join(",", Collections.nCopies(count, "?"));
+    }
+
+    PreparedStatement prepareRoleAssertionsStatement(String action, String domainId, List<String> roleNames)
             throws SQLException {
 
-        PreparedStatement ps;
+        String sql = SQL_LIST_ROLE_ASSERTIONS + placeholders(roleNames.size());
         if (!StringUtil.isEmpty(action)) {
-            ps = con.prepareStatement(SQL_LIST_ROLE_ASSERTIONS + SQL_LIST_ROLE_ASSERTION_QUERY_ACTION);
-            ps.setString(1, action);
+            sql += SQL_LIST_ROLE_ASSERTION_QUERY_ACTION;
         } else {
-            ps = con.prepareStatement(SQL_LIST_ROLE_ASSERTIONS + SQL_LIST_ROLE_ASSERTION_NO_ACTION);
+            sql += SQL_LIST_ROLE_ASSERTION_NO_ACTION;
+        }
+        PreparedStatement ps = con.prepareStatement(sql);
+        ps.setLong(1, Long.parseLong(domainId));
+        for (int i = 0; i < roleNames.size(); i++) {
+            ps.setString(i + 2, roleNames.get(i));
+        }
+        if (!StringUtil.isEmpty(action)) {
+            ps.setString(roleNames.size() + 2, action);
         }
         return ps;
     }
 
-    Map<String, List<Assertion>> getRoleAssertions(String action, String caller) throws ServerResourceException {
+    Map<String, List<Assertion>> getRoleAssertions(Set<String> roleIndexes, String action, String caller)
+            throws ServerResourceException {
 
         Map<String, List<Assertion>> roleAssertions = new HashMap<>();
-        try (PreparedStatement ps = prepareRoleAssertionsStatement(action)) {
-            try (ResultSet rs = executeQuery(ps, caller)) {
-                while (rs.next()) {
-                    Assertion assertion = new Assertion();
-                    String domainName = rs.getString(JDBCConsts.DB_COLUMN_NAME);
-                    String roleName = rs.getString(JDBCConsts.DB_COLUMN_ROLE);
-                    assertion.setRole(ResourceUtils.roleResourceName(domainName, roleName));
-                    assertion.setResource(rs.getString(JDBCConsts.DB_COLUMN_RESOURCE));
-                    assertion.setAction(rs.getString(JDBCConsts.DB_COLUMN_ACTION));
-                    assertion.setEffect(AssertionEffect.valueOf(rs.getString(JDBCConsts.DB_COLUMN_EFFECT)));
-                    assertion.setCaseSensitive(nullIfDefaultValue(rs.getBoolean(JDBCConsts.DB_COLUMN_CASE_SENSITIVE), false));
-                    assertion.setId((long) rs.getInt(JDBCConsts.DB_COLUMN_ASSERT_ID));
+        Map<String, Set<String>> rolesByDomain = new TreeMap<>();
+        for (String roleIndex : roleIndexes) {
+            int separator = roleIndex.indexOf(':');
+            String domainId = roleIndex.substring(0, separator);
+            String roleName = roleIndex.substring(separator + 1);
+            rolesByDomain.computeIfAbsent(domainId, key -> new TreeSet<>()).add(roleName);
+        }
 
-                    String index = roleIndex(rs.getString(JDBCConsts.DB_COLUMN_DOMAIN_ID), roleName);
-                    List<Assertion> assertions = roleAssertions.computeIfAbsent(index, k -> new ArrayList<>());
+        for (Map.Entry<String, Set<String>> entry : rolesByDomain.entrySet()) {
+            List<String> roleNames = new ArrayList<>(entry.getValue());
+            for (int start = 0; start < roleNames.size(); start += RESOURCE_ACCESS_QUERY_BATCH_SIZE) {
+                List<String> batch = roleNames.subList(start,
+                        Math.min(start + RESOURCE_ACCESS_QUERY_BATCH_SIZE, roleNames.size()));
+                try (PreparedStatement ps = prepareRoleAssertionsStatement(action, entry.getKey(), batch);
+                        ResultSet rs = executeQuery(ps, caller)) {
+                    while (rs.next()) {
+                        Assertion assertion = new Assertion();
+                        String domainName = rs.getString(JDBCConsts.DB_COLUMN_NAME);
+                        String roleName = rs.getString(JDBCConsts.DB_COLUMN_ROLE);
+                        assertion.setRole(ResourceUtils.roleResourceName(domainName, roleName));
+                        assertion.setResource(rs.getString(JDBCConsts.DB_COLUMN_RESOURCE));
+                        assertion.setAction(rs.getString(JDBCConsts.DB_COLUMN_ACTION));
+                        assertion.setEffect(AssertionEffect.valueOf(rs.getString(JDBCConsts.DB_COLUMN_EFFECT)));
+                        assertion.setCaseSensitive(nullIfDefaultValue(rs.getBoolean(JDBCConsts.DB_COLUMN_CASE_SENSITIVE), false));
+                        assertion.setId((long) rs.getInt(JDBCConsts.DB_COLUMN_ASSERT_ID));
 
-                    if (LOG.isDebugEnabled()) {
-                        LOG.debug("{}: adding assertion {} for {}", caller, assertion, index);
+                        String index = roleIndex(rs.getString(JDBCConsts.DB_COLUMN_DOMAIN_ID), roleName);
+                        List<Assertion> assertions = roleAssertions.computeIfAbsent(index, k -> new ArrayList<>());
+
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug("{}: adding assertion {} for {}", caller, assertion, index);
+                        }
+
+                        assertions.add(assertion);
                     }
-
-                    assertions.add(assertion);
+                } catch (SQLException ex) {
+                    throw sqlError(ex, caller);
                 }
             }
-        } catch (SQLException ex) {
-            throw sqlError(ex, caller);
         }
 
         return roleAssertions;
@@ -5154,18 +5182,23 @@ public class JDBCConnection implements ObjectStoreConnection {
             return rsrcAccessList;
         }
 
-        // now let's get the list of role assertions. if we have
-        // no matches, then we have nothing to do
+        // The principal's roles can grant access through trusted roles. Include
+        // both sets before querying assertions so we only load rows used below.
 
-        Map<String, List<Assertion>> roleAssertions = getRoleAssertions(action, caller);
+        Map<String, List<String>> trustedRoles = getTrustedRoles(caller);
+        Set<String> rolesToQuery = new HashSet<>(rolePrincipals);
+        for (String roleIndex : rolePrincipals) {
+            List<String> mappedRoles = trustedRoles.get(roleIndex);
+            if (mappedRoles != null) {
+                rolesToQuery.addAll(mappedRoles);
+            }
+        }
+
+        Map<String, List<Assertion>> roleAssertions = getRoleAssertions(rolesToQuery, action, caller);
         if (roleAssertions.isEmpty()) {
             resources.add(getResourceAccessObject(principal, null));
             return rsrcAccessList;
         }
-
-        // finally we need to get all the trusted role maps
-
-        Map<String, List<String>> trustedRoles = getTrustedRoles(caller);
 
         // now let's go ahead and combine all of our data together
         // we're going to go through each principal, lookup

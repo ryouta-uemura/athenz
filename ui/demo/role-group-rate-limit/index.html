@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Role group rate-limit demo</title>
+        <style>
+            :root { font-family: system-ui, sans-serif; color: #182334; background: #f3f6fa; }
+            body { max-width: 1050px; margin: 32px auto; padding: 0 20px; }
+            h1 { margin-bottom: 6px; }
+            p { line-height: 1.5; }
+            .muted { color: #596778; }
+            .panel { background: white; border: 1px solid #dce3ed; border-radius: 10px; padding: 18px; margin-top: 18px; }
+            .controls, .metrics { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+            button { border: 1px solid #1e58a4; background: #1e58a4; color: white; border-radius: 6px; padding: 9px 12px; cursor: pointer; }
+            button.secondary { background: white; color: #1e58a4; }
+            button:disabled { opacity: .5; cursor: wait; }
+            input[type=number] { width: 48px; padding: 7px; }
+            .metric { min-width: 120px; padding: 10px 12px; background: #eef3fa; border-radius: 7px; }
+            .metric strong { display: block; font-size: 23px; }
+            .error { background: #fff0ef; color: #a52620; padding: 12px; border-radius: 7px; }
+            .success { background: #eaf7ed; color: #176433; padding: 12px; border-radius: 7px; }
+            .group-list { max-height: 370px; overflow-y: auto; border: 1px solid #dce3ed; border-radius: 7px; }
+            .group-row { border-bottom: 1px solid #e7edf5; padding: 8px 12px; }
+            .group-row:last-child { border: none; }
+            .group-row button { border: 0; background: none; padding: 0; color: #1e58a4; font: inherit; text-align: left; }
+            .group-detail { margin-top: 8px; padding: 10px; background: #f3f6fa; border-radius: 6px; }
+            .group-detail button { border: 1px solid #1e58a4; padding: 5px 8px; background: white; font-size: 13px; }
+            .hidden { display: none; }
+            .footnote { font-size: 13px; }
+        </style>
+    </head>
+    <body>
+        <h1>Role Members: 155-group fan-out</h1>
+        <p class="muted">Local simulation of the old and fixed request timing. Group names can come from a sanitized ZMS export; rate limiting and group contents are mocked.</p>
+        <div class="panel">
+            <div class="controls">
+                <button id="as-is">Run as-is</button>
+                <button id="to-be">Run to-be</button>
+                <label>Tokens already used per ZMS server <input id="other-used" type="number" min="0" max="19" value="2" /></label>
+                <label><input id="fail-next" type="checkbox" /> Fail next menu lookup (429)</label>
+            </div>
+            <p id="source" class="muted"></p>
+            <p class="footnote muted">Mock ZMS has 8 servers, each with a 20-token bucket. Requests use ideal round-robin routing, so even this favorable case fails when other traffic has used capacity. Set tokens already used to 0 to see the ideal no-429 case.</p>
+        </div>
+        <div class="panel">
+            <h2>Network activity</h2>
+            <div class="metrics">
+                <div class="metric"><strong id="role-count">0</strong>getRole calls</div>
+                <div class="metric"><strong id="group-count">0</strong>getGroup calls</div>
+                <div class="metric"><strong id="reject-count">0</strong>429 responses</div>
+                <div class="metric"><strong id="elapsed">—</strong>role response time</div>
+            </div>
+            <p id="distribution" class="muted footnote"></p>
+        </div>
+        <div class="panel">
+            <h2 id="result-title">Role Members page</h2>
+            <div id="result">Choose as-is or to-be above.</div>
+        </div>
+        <script>
+            const byId = (id) => document.getElementById(id);
+            let currentMode;
+            let cachedDetails = new Map();
+
+            function showStats(stats, elapsed) {
+                byId('role-count').textContent = stats.getRole;
+                byId('group-count').textContent = stats.getGroup;
+                byId('reject-count').textContent = stats.rejected;
+                if (elapsed !== undefined) byId('elapsed').textContent = `${Math.round(elapsed)} ms`;
+                byId('distribution').textContent = 'Requests per mock ZMS server: ' +
+                    stats.perInstance.map((item, index) => `#${index + 1}: ${item.requests}${item.rejected ? ` (${item.rejected} rejected)` : ''}`).join('  ·  ');
+            }
+
+            async function showGroup(name, detail) {
+                detail.classList.remove('hidden');
+                detail.replaceChildren();
+                if (currentMode === 'as-is') {
+                    detail.textContent = `Mock members already loaded: ${cachedDetails.get(name).join(', ')}`;
+                    return;
+                }
+                detail.textContent = 'Loading group members…';
+                const fail = byId('fail-next').checked;
+                byId('fail-next').checked = false;
+                try {
+                    const query = new URLSearchParams({ name, fail: fail ? '1' : '0' });
+                    const response = await fetch(`/api/group?${query}`);
+                    const data = await response.json();
+                    showStats(data.stats);
+                    if (!response.ok) throw new Error(data.error);
+                    detail.textContent = `Mock members: ${data.group.members.join(', ')}`;
+                } catch (error) {
+                    detail.textContent = 'Unable to load group members. ';
+                    const retry = document.createElement('button');
+                    retry.textContent = 'Retry';
+                    retry.onclick = () => showGroup(name, detail);
+                    detail.append(retry);
+                }
+            }
+
+            function showGroups(groups) {
+                const list = document.createElement('div');
+                list.className = 'group-list';
+                for (const name of groups) {
+                    const row = document.createElement('div');
+                    row.className = 'group-row';
+                    const trigger = document.createElement('button');
+                    trigger.textContent = name;
+                    const detail = document.createElement('div');
+                    detail.className = 'group-detail hidden';
+                    trigger.onclick = () => {
+                        if (detail.classList.contains('hidden')) showGroup(name, detail);
+                        else detail.classList.add('hidden');
+                    };
+                    row.append(trigger, detail);
+                    list.append(row);
+                }
+                byId('result').replaceChildren(list);
+            }
+
+            async function run(mode) {
+                currentMode = mode;
+                cachedDetails = new Map();
+                byId('as-is').disabled = true;
+                byId('to-be').disabled = true;
+                byId('result-title').textContent = `Role Members page — ${mode}`;
+                byId('result').textContent = 'Loading role…';
+                const started = performance.now();
+                try {
+                    const otherUsed = byId('other-used').value;
+                    const response = await fetch(`/api/role?mode=${mode}&otherUsed=${otherUsed}`);
+                    const data = await response.json();
+                    showStats(data.stats, performance.now() - started);
+                    if (!response.ok) {
+                        byId('result').textContent = `Role page failed: ${response.status} ${data.error}`;
+                        byId('result').className = 'error';
+                        return;
+                    }
+                    byId('result').className = '';
+                    if (data.details) {
+                        cachedDetails = new Map(data.details.map((group) => [group.name, group.members]));
+                    }
+                    showGroups(data.groups);
+                } catch (error) {
+                    byId('result').textContent = `Demo server error: ${error.message}`;
+                    byId('result').className = 'error';
+                } finally {
+                    byId('as-is').disabled = false;
+                    byId('to-be').disabled = false;
+                }
+            }
+
+            byId('as-is').onclick = () => run('as-is');
+            byId('to-be').onclick = () => run('to-be');
+            fetch('/api/config').then((response) => response.json()).then((config) => {
+                byId('source').textContent = `${config.groupCount} group references (${config.source})`;
+            });
+        </script>
+    </body>
+</html>

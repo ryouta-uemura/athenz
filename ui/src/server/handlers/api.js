@@ -19,6 +19,7 @@ let CLIENTS = require('../clients');
 const errorHandler = require('../utils/errorHandler');
 const userService = require('../services/userService');
 const apiUtils = require('../utils/apiUtils');
+const { enrichRoleGroupMembers } = require('../utils/roleGroupMembers');
 const selfServeZms = require('../utils/selfServeZms');
 const debug = require('debug')('AthenzUI:server:handlers:api');
 const cytoscape = require('cytoscape');
@@ -1391,34 +1392,23 @@ Fetchr.registerService({
 Fetchr.registerService({
     name: 'role',
     read(req, resource, params, config, callback) {
-        let promises = [];
-
-        const getGroupMembers = (domainName, groupName, roleMember) => {
-            return new Promise((resolve, reject) => {
-                req.clients.zms.getGroup(
-                    { domainName, groupName },
-                    (err, data) => {
-                        if (err) {
-                            if (err.status === 404) {
-                                resolve();
-                            } else {
-                                reject(err);
-                            }
-                        } else {
-                            if (data && data.groupMembers) {
-                                roleMember.groupMembers = data.groupMembers;
-                                roleMember.groupMembers.forEach((member) => {
-                                    member.memberFullName =
-                                        userService.getUserFullName(
-                                            member.memberName
-                                        );
-                                });
-                            }
-                            resolve();
-                        }
-                    }
-                );
-            });
+        const finishRole = (data) => {
+            if (data.auditLog) {
+                data.auditLog.forEach((member) => {
+                    member.memberFullName = userService.getUserFullName(
+                        member.member
+                    );
+                    member.adminFullName = userService.getUserFullName(
+                        member.admin
+                    );
+                });
+            }
+            if (!data.roleMembers) {
+                return callback(null, data);
+            }
+            enrichRoleGroupMembers(req, data.roleMembers)
+                .then(() => callback(null, data))
+                .catch((err) => callback(errorHandler.fetcherError(err)));
         };
 
         req.clients.zms.getRole(params, function (err, data) {
@@ -1430,10 +1420,10 @@ Fetchr.registerService({
                         errorHandler.fetcherError(err)
                     )}`
                 );
-                callback(errorHandler.fetcherError(err));
+                return callback(errorHandler.fetcherError(err));
             }
             if (data && data.trust) {
-                req.clients.zms.getRole(
+                return req.clients.zms.getRole(
                     {
                         domainName: params.domainName,
                         roleName: params.roleName,
@@ -1441,103 +1431,30 @@ Fetchr.registerService({
                         expand: true,
                         pending: false,
                     },
-                    function (err, data) {
-                        if (err) {
+                    function (trustedErr, trustedData) {
+                        if (trustedErr) {
                             debug(
                                 `principal: ${req.session.shortId} rid: ${
                                     req.headers.rid
                                 } Error from ZMS while calling getRole API: ${JSON.stringify(
-                                    errorHandler.fetcherError(err)
+                                    errorHandler.fetcherError(trustedErr)
                                 )}`
                             );
-                            callback(errorHandler.fetcherError(err));
-                        }
-                        if (data) {
-                            if (data.auditLog) {
-                                data.auditLog.forEach((m) => {
-                                    m.memberFullName =
-                                        userService.getUserFullName(m.member);
-                                    m.adminFullName =
-                                        userService.getUserFullName(m.admin);
-                                });
-                            }
-                            if (data.roleMembers) {
-                                let roleMembers = data.roleMembers;
-                                roleMembers.forEach((member) => {
-                                    member.memberFullName =
-                                        userService.getUserFullName(
-                                            member.memberName
-                                        );
-                                });
-
-                                roleMembers.forEach((member) => {
-                                    if (member.memberName.includes(':group.')) {
-                                        promises.push(
-                                            getGroupMembers(
-                                                member.memberName.split(
-                                                    ':group.'
-                                                )[0],
-                                                member.memberName.split(
-                                                    ':group.'
-                                                )[1],
-                                                member
-                                            )
-                                        );
-                                    }
-                                });
-                                Promise.all(promises)
-                                    .then(() => {
-                                        callback(null, data);
-                                    })
-                                    .catch((err) => {
-                                        callback(
-                                            errorHandler.fetcherError(err)
-                                        );
-                                    });
-                            } else {
-                                callback(null, data);
-                            }
-                        }
-                    }
-                );
-            } else if (data) {
-                if (data.auditLog) {
-                    data.auditLog.forEach((m) => {
-                        m.memberFullName = userService.getUserFullName(
-                            m.member
-                        );
-                        m.adminFullName = userService.getUserFullName(m.admin);
-                    });
-                }
-                if (data.roleMembers) {
-                    let roleMembers = data.roleMembers;
-                    roleMembers.forEach((member) => {
-                        member.memberFullName = userService.getUserFullName(
-                            member.memberName
-                        );
-                    });
-                    roleMembers.forEach((member) => {
-                        if (member.memberName.includes(':group.')) {
-                            promises.push(
-                                getGroupMembers(
-                                    member.memberName.split(':group.')[0],
-                                    member.memberName.split(':group.')[1],
-                                    member
-                                )
+                            return callback(
+                                errorHandler.fetcherError(trustedErr)
                             );
                         }
-                    });
-                    Promise.all(promises)
-                        .then(() => {
-                            callback(null, data);
-                        })
-                        .catch((err) => {
-                            callback(errorHandler.fetcherError(err));
-                        });
-                } else {
-                    callback(null, data);
-                }
+                        if (trustedData) {
+                            return finishRole(trustedData);
+                        }
+                        callback(null, trustedData);
+                    }
+                );
             }
+            if (data) {
+                return finishRole(data);
+            }
+            callback(null, data);
         });
     },
     create(req, resource, params, body, config, callback) {
